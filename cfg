@@ -1,0 +1,15 @@
+digraph {
+	entry [label="entry
+x_0 := 3
+if (x_0 < 5) then then1 else else2" shape=box]
+	then1 [label="then1
+y_0 := (x_0 + 1)" shape=box]
+	else2 [label="else2
+y_0_0 := (x_0 - 1)" shape=box]
+	join3 [label="join3
+z_0 := (x_0 * 2)" shape=box]
+	entry -> then1
+	entry -> else2
+	then1 -> join3
+	else2 -> join3
+}

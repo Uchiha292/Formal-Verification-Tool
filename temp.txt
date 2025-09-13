@@ -1,0 +1,1890 @@
+# updated main
+import sys
+import textwrap
+from Parser import Parser
+from ssa_converter import SSAConverter, pretty_print_ssa
+from smt_converter import generate_smt_lib
+from Unroll import LoopUnroller
+from verify import ProgramVerifier
+
+def main():
+
+    code = textwrap.dedent("""
+      sum := 10;
+      for (i := 1; i <= 10; i := i + 1) {
+        sum := sum + i;
+        }      
+        """)
+
+
+# Equivalence Check
+    program1_code = textwrap.dedent("""
+      sum := 10;
+      for (i := 1; i <= 10; i := i + 1) {
+        sum := sum + i;
+        }
+      """)
+
+    program2_code = textwrap.dedent("""
+      sum := 0;
+        i := 5;
+        while (i >= 1) {
+            sum := sum + i;
+            i := i - 1;
+        }
+      """)
+
+
+    parser = Parser()
+    ast = parser.parse_program(code)
+
+    # Ask user for the unroll depth
+    unroll_depth = int(input("Enter the number of times to unroll loops: "))
+
+    # Create a LoopUnroller instance and set the unroll depth
+    unroller = LoopUnroller(parser)
+    unroller.set_unroll_depth(unroll_depth)  # Set the user-defined unroll depth
+    unrolled_ast = unroller.unroll_program(ast)  # Unroll loops in the AST
+
+    print("=== Original Program ===")
+    print(code.strip())
+
+    print("\n==== Unrolled Program ====")
+    unroller.pretty_print_unrolled_program(unrolled_ast)  # Pretty print the unrolled program
+
+    converter = SSAConverter()
+    ssa_program = converter.convert_program(unrolled_ast)  # Convert unrolled AST to SSA
+
+    print("\n==== SSA Form ====")
+    pretty_print_ssa(ssa_program)
+
+    print("\n==== SMT-LIB ====")
+    print("Generated SMT-LIB:")
+    print(generate_smt_lib(ssa_program))
+
+    print("\n==== Verification ====")
+    verifier = ProgramVerifier()
+    verifier.set_unroll_depth(unroll_depth)
+    result = verifier.verify_program(generate_smt_lib(ssa_program))
+
+    if result['status'] == 'success':
+        print("✓ " + result['message'])
+    elif result['status'] == 'failed':
+        print("✗ " + result['message'])
+        if 'counterexample' in result:
+            print("Counterexample:")
+            for var, value in result['counterexample'].items():
+                print(f"  {var} = {value}")
+    elif result['status'] == 'error':
+        print("Error: " + result['message'])
+    else:
+        print("Verification result: " + result['message'])
+
+
+    print("\n==== Equivalence Check ====")
+    equiChecker = ProgramVerifier()
+    equiChecker.set_unroll_depth(unroll_depth)
+    equiResult = equiChecker.check_equivalence(program1_code, program2_code)
+
+    if equiResult['equivalent']:
+      print("Programs are semantically equivalent!")
+    else:
+      print("Programs are NOT equivalent!")
+      if 'counterexample' in equiResult:
+        print("Counterexample:")
+        for var, value in equiResult['counterexample'].items():
+          print(f"  {var} = {value}")
+
+
+if __name__ == "__main__":
+    main()# Parser.py
+"""
+Parser for the custom mini-language.
+This module handles parsing programs written in our custom mini-language.
+"""
+import re
+
+class Parser:
+    def __init__(self):
+        self.tokens = []
+        self.pos = 0
+        self.variables = set()
+        self.arrays = {}
+        self.array_size = {}
+
+    def tokenize(self, code):
+        """Convert code string into tokens."""
+        # Remove comments
+        code = re.sub(r'//.*', '', code)
+
+        # Define token patterns
+        token_patterns = [
+            ('NUMBER', r'\d+'),
+            ('IDENTIFIER', r'[a-zA-Z][a-zA-Z0-9_]*'),
+            ('ASSIGN', r':='),
+            ('EQ', r'=='),
+            ('NEQ', r'!='),
+            ('LTE', r'<='),
+            ('GTE', r'>='),
+            ('LT', r'<'),
+            ('GT', r'>'),
+            ('PLUS', r'\+'),
+            ('MINUS', r'-'),
+            ('MULT', r'\*'),
+            ('DIV', r'/'),
+            ('LPAREN', r'\('),
+            ('RPAREN', r'\)'),
+            ('LBRACE', r'\{'),
+            ('RBRACE', r'\}'),
+            ('LBRACKET', r'\['),
+            ('RBRACKET', r'\]'),
+            ('SEMICOLON', r';'),
+            ('COMMA', r','),
+            ('WHITESPACE', r'\s+'),
+            ('UNKNOWN', r'.'),
+        ]
+
+        token_regex = '|'.join('(?P<%s>%s)' % pair for pair in token_patterns)
+        self.tokens = []
+
+        for mo in re.finditer(token_regex, code):
+            kind = mo.lastgroup
+            value = mo.group()
+            if kind == 'WHITESPACE':
+                continue
+            self.tokens.append((kind, value))
+
+        self.pos = 0
+        return self.tokens
+
+    def peek(self):
+        """Look at the current token without consuming it."""
+        if self.pos < len(self.tokens):
+            return self.tokens[self.pos]
+        return None
+
+    def consume(self):
+        """Consume the current token and advance to the next."""
+        token = self.peek()
+        self.pos += 1
+        return token
+
+    def match(self, expected_type):
+        """Match and consume a token of the expected type."""
+        token = self.peek()
+        if token and token[0] == expected_type:
+            return self.consume()
+        return None
+
+    def expect(self, expected_type):
+        """Expect a token of a certain type, raise error if not found."""
+        token = self.match(expected_type)
+        if token:
+            return token
+        else:
+            current = self.peek()
+            raise SyntaxError(f"Expected {expected_type}, got {current[0] if current else 'EOF'}")
+
+    def parse_program(self, code):
+        """Parse a complete program."""
+        self.tokenize(code)
+        statements = []
+
+        while self.pos < len(self.tokens):
+            stmt = self.parse_statement()
+            if stmt:
+                statements.append(stmt)
+
+        return statements
+
+    def parse_statement(self):
+        """Parse a statement."""
+        token = self.peek()
+        if not token:
+            return None
+
+        if token[0] == 'IDENTIFIER' and self.tokens[self.pos + 1][0] == 'ASSIGN':
+            return self.parse_assignment()
+        elif token[0] == 'IDENTIFIER' and token[1] == 'if':
+            return self.parse_if_statement()
+        elif token[0] == 'IDENTIFIER' and token[1] == 'while':
+            return self.parse_while_loop()
+        elif token[0] == 'IDENTIFIER' and token[1] == 'for':
+            return self.parse_for_loop()
+        elif token[0] == 'IDENTIFIER' and token[1] == 'assert':
+            return self.parse_assert()
+        else:
+            # Skip unknown statements
+            self.consume()
+            if self.match('SEMICOLON'):
+                pass
+            return {'type': 'skip'}
+
+    def parse_assignment(self):
+        """Parse an assignment statement."""
+        var_token = self.expect('IDENTIFIER')
+        var_name = var_token[1]
+        self.variables.add(var_name)
+
+        # Check if this is an array assignment
+        if self.match('LBRACKET'):
+            index_expr = self.parse_expression()
+            self.expect('RBRACKET')
+            self.expect('ASSIGN')
+            value_expr = self.parse_expression()
+            self.expect('SEMICOLON')
+            return {
+                'type': 'array_assign',
+                'array': var_name,
+                'index': index_expr,
+                'value': value_expr
+            }
+        else:
+            self.expect('ASSIGN')
+            expr = self.parse_expression()
+            self.expect('SEMICOLON')
+            return {
+                'type': 'assign',
+                'var': var_name,
+                'expr': expr
+            }
+
+    def parse_if_statement(self):
+        """Parse an if statement."""
+        self.expect('IDENTIFIER')  # Consume 'if'
+        self.expect('LPAREN')
+        condition = self.parse_expression()
+        self.expect('RPAREN')
+
+        self.expect('LBRACE')
+        then_block = []
+        while self.peek() and self.peek()[0] != 'RBRACE':
+            stmt = self.parse_statement()
+            if stmt:
+                then_block.append(stmt)
+        self.expect('RBRACE')
+
+        else_block = []
+        if self.peek() and self.peek()[0] == 'IDENTIFIER' and self.peek()[1] == 'else':
+            self.consume()  # Consume 'else'
+            self.expect('LBRACE')
+            while self.peek() and self.peek()[0] != 'RBRACE':
+                stmt = self.parse_statement()
+                if stmt:
+                    else_block.append(stmt)
+            self.expect('RBRACE')
+
+        return {
+            'type': 'if',
+            'condition': condition,
+            'then_block': then_block,
+            'else_block': else_block
+        }
+
+    def parse_while_loop(self):
+        """Parse a while loop."""
+        self.expect('IDENTIFIER')  # Consume 'while'
+        self.expect('LPAREN')
+        condition = self.parse_expression()
+        self.expect('RPAREN')
+
+        self.expect('LBRACE')
+        body = []
+        while self.peek() and self.peek()[0] != 'RBRACE':
+            stmt = self.parse_statement()
+            if stmt:
+                body.append(stmt)
+        self.expect('RBRACE')
+
+        return {
+            'type': 'while',
+            'condition': condition,
+            'body': body
+        }
+
+    def parse_for_loop(self):
+        """Parse a for loop."""
+        self.expect('IDENTIFIER')  # Consume 'for'
+        self.expect('LPAREN')
+
+        # Initialize
+        init = self.parse_statement()
+
+        # Condition
+        condition = self.parse_expression()
+        self.expect('SEMICOLON')
+
+        # Update
+        update = self.parse_statement()
+
+        self.expect('RPAREN')
+
+        # Body
+        self.expect('LBRACE')
+        body = []
+        while self.peek() and self.peek()[0] != 'RBRACE':
+            stmt = self.parse_statement()
+            if stmt:
+                body.append(stmt)
+        self.expect('RBRACE')
+
+        return {
+            'type': 'for',
+            'init': init,
+            'condition': condition,
+            'update': update,
+            'body': body
+        }
+
+    def parse_assert(self):
+        """Parse an assert statement."""
+        self.expect('IDENTIFIER')  # Consume 'assert'
+        self.expect('LPAREN')
+        condition = self.parse_expression()
+        self.expect('RPAREN')
+        self.expect('SEMICOLON')
+
+        return {
+            'type': 'assert',
+            'condition': condition
+        }
+
+    def parse_expression(self):
+        """Parse an expression."""
+        return self.parse_comparison()
+
+    def parse_comparison(self):
+        """Parse a comparison expression."""
+        left = self.parse_additive()
+
+        if self.peek() and self.peek()[0] in ['EQ', 'NEQ', 'LT', 'GT', 'LTE', 'GTE']:
+            op = self.consume()
+            right = self.parse_additive()
+            return {
+                'type': 'binary',
+                'op': op[1],
+                'left': left,
+                'right': right
+            }
+
+        return left
+
+    def parse_additive(self):
+        """Parse an additive expression."""
+        left = self.parse_multiplicative()
+
+        while self.peek() and self.peek()[0] in ['PLUS', 'MINUS']:
+            op = self.consume()
+            right = self.parse_multiplicative()
+            left = {
+                'type': 'binary',
+                'op': op[1],
+                'left': left,
+                'right': right
+            }
+
+        return left
+
+    def parse_multiplicative(self):
+        """Parse a multiplicative expression."""
+        left = self.parse_primary()
+
+        while self.peek() and self.peek()[0] in ['MULT', 'DIV']:
+            op = self.consume()
+            right = self.parse_primary()
+            left = {
+                'type': 'binary',
+                'op': op[1],
+                'left': left,
+                'right': right
+            }
+
+        return left
+
+    def parse_primary(self):
+        """Parse a primary expression."""
+        token = self.peek()
+
+        if token is None:
+            raise SyntaxError("Unexpected end of input")
+
+        if self.match('NUMBER'):
+            return {
+                'type': 'number',
+                'value': int(token[1])
+            }
+        elif self.match('IDENTIFIER'):
+            var_name = token[1]
+            self.variables.add(var_name)
+
+            # Check if this is an array access
+            if self.peek() and self.peek()[0] == 'LBRACKET':
+                self.consume()  # Consume '['
+                index = self.parse_expression()
+                self.expect('RBRACKET')
+                return {
+                    'type': 'array_access',
+                    'array': var_name,
+                    'index': index
+                }
+            else:
+                return {
+                    'type': 'variable',
+                    'name': var_name
+                }
+        elif self.match('LPAREN'):
+            expr = self.parse_expression()
+            self.expect('RPAREN')
+            return expr
+        else:
+            raise SyntaxError(f"Unexpected token: {token}")
+
+def pretty_print_ast(ast, indent=0):
+    """Pretty print the AST for debugging."""
+    for stmt in ast:
+        print('  ' * indent + f"- {stmt['type']}")
+        if stmt['type'] == 'assign':
+            print('  ' * (indent + 1) + f"var: {stmt['var']}")
+            pretty_print_ast([stmt['expr']], indent + 1)
+        elif stmt['type'] == 'array_assign':
+            print('  ' * (indent + 1) + f"array: {stmt['array']}")
+            print('  ' * (indent + 1) + "index:")
+            pretty_print_ast([stmt['index']], indent + 2)
+            print('  ' * (indent + 1) + "value:")
+            pretty_print_ast([stmt['value']], indent + 2)
+        elif stmt['type'] in ['if', 'while', 'for']:
+            print('  ' * (indent + 1) + "condition:")
+            pretty_print_ast([stmt['condition']], indent + 2)
+            if stmt['type'] == 'if':
+                print('  ' * (indent + 1) + "then:")
+                pretty_print_ast(stmt['then_block'], indent + 2)
+                print('  ' * (indent + 1) + "else:")
+                pretty_print_ast(stmt['else_block'], indent + 2)
+            elif stmt['type'] == 'while':
+                print('  ' * (indent + 1) + "body:")
+                pretty_print_ast(stmt['body'], indent + 2)
+            elif stmt['type'] == 'for':
+                print('  ' * (indent + 1) + "init:")
+                pretty_print_ast([stmt['init']], indent + 2)
+                print('  ' * (indent + 1) + "update:")
+                pretty_print_ast([stmt['update']], indent + 2)
+                print('  ' * (indent + 1) + "body:")
+                pretty_print_ast(stmt['body'], indent + 2)
+        elif stmt['type'] == 'assert':
+            print('  ' * (indent + 1) + "condition:")
+            pretty_print_ast([stmt['condition']], indent + 2)
+        elif stmt['type'] == 'binary':
+            print('  ' * (indent + 1) + f"op: {stmt['op']}")
+            print('  ' * (indent + 1) + "left:")
+            pretty_print_ast([stmt['left']], indent + 2)
+            print('  ' * (indent + 1) + "right:")
+            pretty_print_ast([stmt['right']], indent + 2)
+        elif stmt['type'] == 'variable':
+            print('  ' * (indent + 1) + f"name: {stmt['name']}")
+        elif stmt['type'] == 'number':
+            print('  ' * (indent + 1) + f"value: {stmt['value']}")
+        elif stmt['type'] == 'array_access':
+            print('  ' * (indent + 1) + f"array: {stmt['array']}")
+            print('  ' * (indent + 1) + "index:")
+            pretty_print_ast([stmt['index']], indent + 2)
+        elif stmt['type'] == 'skip':
+            continue
+
+def pretty_print_expr(expr, indent=0):
+    """Pretty print an expression."""
+    if expr['type'] == 'number':
+        print('  ' * indent + f"number: {expr['value']}")
+    elif expr['type'] == 'variable':
+        print('  ' * indent + f"variable: {expr['name']}")
+    elif expr['type'] == 'array_access':
+        print('  ' * indent + f"array_access: {expr['array']}")
+        print('  ' * (indent+1) + "index:")
+        pretty_print_expr(expr['index'], indent+2)
+    elif expr['type'] == 'binary':
+        print('  ' * indent + f"binary: {expr['op']}")
+        print('  ' * (indent+1) + "left:")
+        pretty_print_expr(expr['left'], indent+2)
+        print('  ' * (indent+1) + "right:")
+        pretty_print_expr(expr['right'], indent+2)
+    elif expr['type'] == 'not':
+        print('  ' * indent + "not:")
+        pretty_print_expr(expr['expr'], indent+1)
+
+# if __name__ == "__main__":
+#     # Test the parser with a simple example
+#     code = """
+#     x = 5;
+#     y = x + 3;
+#     if (y > 5) {
+#        z = y - 1;
+#     }
+
+#     """
+
+#     print("Starting parsing...")
+#     parser = Parser()
+#     ast = parser.parse_program(code)
+#     print("Parsed AST:")
+#     pretty_print_ast(ast)# smt_converter.py
+# smt_generator.py
+from typing import Dict, List
+
+class SMTGenerator:
+    def __init__(self):
+        self.declarations = set()
+        self.constraints = []
+        self.current_assertions = []
+        self.join_conditions: Dict[str, Dict] = {}
+        self.var_map = {}
+
+    def generate_smt(self, ssa_program) -> List[str]:
+        # First pass: Build join block condition map
+        self._build_join_condition_map(ssa_program)
+
+        # Second pass: Generate constraints
+        for block in ssa_program:
+            self._process_block(block)
+
+        return [
+            *[f"(declare-const {v} Int)" for v in self.declarations],
+            "",
+            *self.constraints,
+            "",
+            *self.current_assertions
+        ]
+
+    def _build_join_condition_map(self, ssa_program):
+        """Create mapping from join blocks to their controlling conditions"""
+        for block in ssa_program:
+            for stmt in block["statements"]:
+                if stmt["type"] == "ssa_if":
+                    self.join_conditions[stmt["join_block"]] = {
+                        "condition": stmt["condition"],
+                        "then_block": stmt["then_block"],
+                        "else_block": stmt["else_block"]
+                    }
+
+    def _process_block(self, block):
+        for stmt in block["statements"]:
+            handler = {
+                "ssa_assign": self._handle_assign,
+                "ssa_array_assign": self._handle_array_assign,
+                "phi": self._handle_phi,
+                "ssa_assert": self._handle_assert,
+                "ssa_if": self._handle_if
+            }.get(stmt["type"], lambda x: None)
+
+            handler(stmt)
+
+    def _declare_var(self, var_name):
+        if var_name not in self.declarations:
+            self.declarations.add(var_name)
+            self.var_map[var_name] = var_name
+
+    def _handle_assign(self, stmt):
+        var = stmt["var"]
+        expr = self._convert_expr(stmt["expr"])
+        self._declare_var(var)
+        self.constraints.append(f"(assert (= {var} {expr}))")
+
+    def _handle_array_assign(self, stmt):
+        array_var = stmt["array"]
+        old_array = stmt["old_array"]
+        index = self._convert_expr(stmt["index"])
+        value = self._convert_expr(stmt["value"])
+
+        self._declare_var(array_var)
+        self.constraints.append(
+            f"(assert (= {array_var} (store {old_array} {index} {value})))"
+        )
+
+    def _handle_phi(self, stmt):
+        join_block = [k for k, v in self.join_conditions.items()
+                     if v["then_block"] in stmt["sources"]
+                     and v["else_block"] in stmt["sources"]][0]
+
+        condition = self._convert_expr(
+            self.join_conditions[join_block]["condition"]
+        )
+
+        then_var = stmt["sources"][self.join_conditions[join_block]["then_block"]]
+        else_var = stmt["sources"][self.join_conditions[join_block]["else_block"]]
+        phi_var = stmt["var"]
+
+        self._declare_var(phi_var)
+        self.constraints.append(
+            f"(assert (= {phi_var} (ite {condition} {then_var} {else_var})))"
+        )
+
+    def _handle_assert(self, stmt):
+        expr = self._convert_expr(stmt["condition"])
+        self.current_assertions.append(f"(assert (not {expr}))")
+
+    def _handle_if(self, stmt):
+        # Handled in join condition map
+        pass
+
+    def _convert_expr(self, expr) -> str:
+        if expr["type"] == "number":
+            return str(expr["value"])
+        if expr["type"] == "variable":
+            return self.var_map.get(expr["name"], expr["name"])
+        if expr["type"] == "array_access":
+            array = self._convert_expr(expr["array"])
+            index = self._convert_expr(expr["index"])
+            return f"(select {array} {index})"
+        if expr["type"] == "binary":
+            left = self._convert_expr(expr["left"])
+            right = self._convert_expr(expr["right"])
+            op = {
+                "+": "+", "-": "-", "*": "*", "/": "div",
+                "==": "=", "!=": "distinct",
+                "<": "<", ">": ">", "<=": "<=", ">=": ">="
+            }[expr["op"]]
+            return f"({op} {left} {right})"
+        raise ValueError(f"Unsupported expression type: {expr['type']}")
+
+def generate_smt_lib(ssa_program) -> str:
+    generator = SMTGenerator()
+    constraints = generator.generate_smt(ssa_program)
+    return "\n".join([
+        "(set-logic QF_AUFLIA)",
+        ""
+    ] + constraints + [
+        "(check-sat)",
+        "(get-model)"
+    ])
+
+# ssa_converter.py
+"""
+SSA Converter for the custom mini-language.
+This module converts parsed AST from Parser into SSA form.
+"""
+from Parser import Parser
+
+class SSAConverter:
+    def __init__(self):
+        self.var_versions = {}  # Tracks the latest version of each variable
+        self.phi_functions = {}
+        self.counter = 0
+        self.current_block = "entry"
+        self.blocks = {"entry": []}
+        self.cfg = {}  # Control flow graph
+
+    def fresh_var(self, base_name):
+        """Generate a fresh variable name with incremented version number."""
+        if base_name not in self.var_versions:
+            self.var_versions[base_name] = 0
+            return f"{base_name}_0"
+        else:
+            self.var_versions[base_name] += 1
+            return f"{base_name}_{self.var_versions[base_name]}"
+
+    def fresh_label(self, prefix="L"):
+        """Generate a unique label for code blocks."""
+        self.counter += 1
+        return f"{prefix}{self.counter}"
+
+    def convert_program(self, ast):
+        """Convert the entire program AST to SSA form."""
+        for stmt in ast:
+            ssa_stmt = self.convert_statement(stmt)
+            if ssa_stmt:
+                if isinstance(ssa_stmt, list):
+                    self.blocks[self.current_block].extend(ssa_stmt)
+                else:
+                    self.blocks[self.current_block].append(ssa_stmt)
+
+        # Assemble the final SSA program from all blocks
+        ssa_program = []
+        for block_name, block_stmts in self.blocks.items():
+            ssa_program.append({"type": "block", "label": block_name, "statements": block_stmts})
+        return ssa_program
+
+    def convert_statement(self, stmt):
+        """Convert a single statement to SSA form."""
+        if not stmt:
+            return None
+
+        stmt_type = stmt.get('type')
+        handlers = {
+            'assign': self.convert_assignment,
+            'array_assign': self.convert_array_assignment,
+            'if': self.convert_if_statement,
+            'while': self.convert_while_loop,
+            'for': self.convert_for_loop,
+            'assert': self.convert_assert,
+            'skip': lambda x: None
+        }
+        return handlers.get(stmt_type, self.handle_unknown)(stmt)
+
+    def handle_unknown(self, stmt):
+        """Handle unknown statement types."""
+        raise ValueError(f"Unknown statement type: {stmt.get('type')}")
+
+    def convert_assignment(self, stmt):
+        """Convert an assignment statement to SSA form."""
+        var_name = stmt['var']
+        expr_ssa = self.convert_expression(stmt['expr'])
+
+        # Increment version only when creating a new assignment
+        self.var_versions[var_name] = self.var_versions.get(var_name, -1) + 1
+        new_var = f"{var_name}_{self.var_versions[var_name]}"
+
+        return {"type": "ssa_assign", "var": new_var, "expr": expr_ssa}
+
+    def convert_array_assignment(self, stmt):
+        """Convert an array assignment statement to SSA form."""
+        array_name = stmt['array']
+        index_ssa = self.convert_expression(stmt['index'])
+        value_ssa = self.convert_expression(stmt['value'])
+        # Get current version before creating a new one
+        old_array = self.get_current_version(array_name)
+        new_array = self.fresh_var(array_name)
+        return {
+            "type": "ssa_array_assign",
+            "array": new_array,
+            "old_array": old_array,
+            "index": index_ssa,
+            "value": value_ssa
+        }
+
+    def convert_if_statement(self, stmt):
+        """Convert an if statement to SSA form."""
+        condition_ssa = self.convert_expression(stmt['condition'])
+
+        # Save current state before processing branches
+        parent_block = self.current_block
+        parent_versions = self.var_versions.copy()
+
+        # Create blocks for then, else, and join
+        then_label = self.fresh_label("then")
+        else_label = self.fresh_label("else")
+        join_label = self.fresh_label("join")
+
+        # Create the if statement first in the PARENT block
+        ssa_if_stmt = {
+            "type": "ssa_if",
+            "condition": condition_ssa,
+            "then_block": then_label,
+            "else_block": else_label,
+            "join_block": join_label
+        }
+
+        # Add the if statement to the current (parent) block
+        self.blocks[parent_block].append(ssa_if_stmt)
+
+        # Update control flow graph
+        self.cfg.setdefault(parent_block, []).extend([then_label, else_label])
+        self.cfg.setdefault(then_label, []).append(join_label)
+        self.cfg.setdefault(else_label, []).append(join_label)
+
+        # Process then block with a separate variable version namespace
+        self.current_block = then_label
+        self.blocks[then_label] = []
+
+        # Copy parent versions for the then block
+        self.var_versions = parent_versions.copy()
+
+        # Now process the block statements
+        for s in stmt['then_block']:
+            then_stmt = self.convert_statement(s)
+            if then_stmt:
+                if isinstance(then_stmt, list):
+                    self.blocks[then_label].extend(then_stmt)
+                else:
+                    self.blocks[then_label].append(then_stmt)
+
+        # Save then branch final variable versions
+        then_final_versions = self.var_versions.copy()
+
+        # Process else block with a separate variable version namespace
+        self.current_block = else_label
+        self.blocks[else_label] = []
+
+        # Copy only relevant versions for the else block
+        self.var_versions = parent_versions.copy()
+
+        # Now process the block statements
+        for s in stmt['else_block']:
+            # Ensure we reference the latest version from the then block if used
+            if 'var' in s and s['var'] in then_final_versions:
+                # Increment the current variable version by 1
+                current_version = then_final_versions[s['var']] + 1
+                s['var'] = f"{s['var']}_{current_version - 1}"
+
+            else_stmt = self.convert_statement(s)
+            if else_stmt:
+                if isinstance(else_stmt, list):
+                    self.blocks[else_label].extend(else_stmt)
+                else:
+                   self.blocks[else_label].append(else_stmt)
+
+        # Save else branch final variable versions
+        else_final_versions = self.var_versions.copy()
+
+        # Set up join block
+        self.current_block = join_label
+        self.blocks[join_label] = []
+
+        # Create phi functions for variables modified in either branch
+        modified_vars = set()
+        all_vars = set(then_final_versions.keys()).union(set(else_final_versions.keys()))
+
+        for var in all_vars:
+            parent_ver = parent_versions.get(var, 0)
+            then_ver = then_final_versions.get(var, parent_ver)
+            else_ver = else_final_versions.get(var, parent_ver)
+
+            # If the variable was modified in either branch
+            if then_ver != parent_ver or else_ver != parent_ver:
+                modified_vars.add(var)
+
+        # Create phi functions and update variable versions
+        phi_statements = []
+
+        # Update the phi function creation in convert_if_statement
+        for var in modified_vars:
+            # Get the correct version from each branch
+            then_ver = then_final_versions.get(var, parent_versions.get(var, 0))
+            else_ver = else_final_versions.get(var, parent_versions.get(var, 0))
+
+            then_var = f"{var}_{then_ver}"
+            else_var = f"{var}_{else_ver}"
+
+            # Create new versions for the phi function
+            self.var_versions[var] = max(then_ver, else_ver) + 1
+            new_var = f"{var}_{self.var_versions[var]}"
+
+            phi_statements.append({
+               "type": "phi",
+                "var": new_var,
+                "sources": {then_label: then_var, else_label: else_var}
+            })
+
+        # Add phi statements to join block
+        self.blocks[join_label].extend(phi_statements)
+
+        # Return None since we've already added the if statement to the parent block
+        return None
+
+    def convert_while_loop(self, stmt):
+        """Convert a while loop to SSA form."""
+        # Create block labels
+        header_label = self.fresh_label("while_header")
+        body_label = self.fresh_label("while_body")
+        exit_label = self.fresh_label("while_exit")
+
+        # Save parent block and variable versions
+        parent_block = self.current_block
+        parent_versions = self.var_versions.copy()
+
+        # Create the while statement in the parent block
+        ssa_while_stmt = {
+            "type": "ssa_while",
+            "header_block": header_label,
+            "body_block": body_label,
+            "exit_block": exit_label
+        }
+
+        # Add the while statement to the parent block
+        self.blocks[parent_block].append(ssa_while_stmt)
+
+        # Update CFG
+        self.cfg.setdefault(parent_block, []).append(header_label)
+
+        # Initialize header block with placeholders for phi functions
+        self.current_block = header_label
+        self.blocks[header_label] = []
+
+        # Copy parent versions for initial header processing
+        header_versions = parent_versions.copy()
+        self.var_versions = header_versions
+
+        # Convert condition in header block context
+        condition_ssa = self.convert_expression(stmt['condition'])
+
+        # Add condition to header block
+        self.blocks[header_label].append({
+            "type": "ssa_condition",
+            "condition": condition_ssa,
+            "true_target": body_label,
+            "false_target": exit_label
+        })
+
+        # Save header block variable versions after condition evaluation
+        header_after_condition_versions = self.var_versions.copy()
+
+        # Initialize and process body block
+        self.current_block = body_label
+        self.blocks[body_label] = []
+        body_init_versions = header_after_condition_versions.copy()
+        self.var_versions = body_init_versions
+
+        for s in stmt['body']:
+            body_stmt = self.convert_statement(s)
+            if body_stmt:
+                if isinstance(body_stmt, list):
+                    self.blocks[body_label].extend(body_stmt)
+                else:
+                    self.blocks[body_label].append(body_stmt)
+
+        # Add jump back to header at end of body
+        self.blocks[body_label].append({
+            "type": "ssa_jump",
+            "target": header_label
+        })
+
+        # Save body block variable versions after processing
+        body_final_versions = self.var_versions.copy()
+
+        # Update CFG for the loop structure
+        self.cfg.setdefault(header_label, []).extend([body_label, exit_label])
+        self.cfg.setdefault(body_label, []).append(header_label)
+
+        # Identify variables modified in loop body
+        modified_vars = set()
+        for var in body_final_versions:
+            if var not in parent_versions or parent_versions[var] != body_final_versions[var]:
+                modified_vars.add(var)
+
+        # Create phi functions for the header block
+        phi_statements = []
+
+        # Track the new versions that will be created by phi functions
+        new_header_versions = parent_versions.copy()
+
+        for var in modified_vars:
+            # Get versions from entry and body
+            entry_ver = parent_versions.get(var, 0)
+            body_ver = body_final_versions.get(var, 0)
+
+            entry_var = f"{var}_{entry_ver}"
+            body_var = f"{var}_{body_ver}"
+
+            # Increment version for phi result
+            new_header_versions[var] = max(entry_ver, body_ver) + 1
+            new_var = f"{var}_{new_header_versions[var]}"
+
+            phi_statements.append({
+                "type": "phi",
+                "var": new_var,
+                "sources": {parent_block: entry_var, body_label: body_var}
+            })
+
+        # Insert phi statements at the beginning of header block
+        self.blocks[header_label] = phi_statements + self.blocks[header_label]
+
+        # Update variable versions with those from phi functions
+        self.var_versions = new_header_versions
+
+        # Set up exit block
+        self.current_block = exit_label
+        self.blocks[exit_label] = []
+
+        # Update the while statement condition in the parent block
+        ssa_while_stmt["condition"] = condition_ssa
+
+        # Return None since we've already added the while statement to the parent block
+        return None
+
+    def convert_for_loop(self, stmt):
+        """Convert a for loop to SSA form."""
+        # Process initialization
+        init_statements = []
+        if stmt['init']:
+            init_ssa = self.convert_statement(stmt['init'])
+            if init_ssa:
+                init_statements.extend(init_ssa if isinstance(init_ssa, list) else [init_ssa])
+
+        # Create block labels
+        header_label = self.fresh_label("for_header")
+        body_label = self.fresh_label("for_body")
+        update_label = self.fresh_label("for_update")
+        exit_label = self.fresh_label("for_exit")
+
+        # Save parent block and variable versions after initialization
+        parent_block = self.current_block
+        parent_versions = self.var_versions.copy()
+
+        # Create for loop statement in parent block
+        ssa_for_stmt = {
+            "type": "ssa_for",
+            "init_block": parent_block,
+            "header_block": header_label,
+            "body_block": body_label,
+            "update_block": update_label,
+            "exit_block": exit_label
+        }
+
+        # Add the for statement to the parent block
+        self.blocks[parent_block].append(ssa_for_stmt)
+
+        # Update CFG
+        self.cfg.setdefault(parent_block, []).append(header_label)
+
+        # Add init statements to parent block
+        self.blocks.setdefault(parent_block, []).extend(init_statements)
+
+        # Create header block for condition
+        self.current_block = header_label
+        self.blocks[header_label] = []
+        header_versions = parent_versions.copy()
+        self.var_versions = header_versions
+
+        # Convert condition in header block context
+        condition_ssa = self.convert_expression(stmt['condition'])
+
+        # Add condition to header block
+        self.blocks[header_label].append({
+            "type": "ssa_condition",
+            "condition": condition_ssa,
+            "true_target": body_label,
+            "false_target": exit_label
+        })
+
+        # Process body block
+        self.current_block = body_label
+        self.blocks[body_label] = []
+        body_versions = self.var_versions.copy()
+        self.var_versions = body_versions
+
+        for s in stmt['body']:
+            body_stmt = self.convert_statement(s)
+            if body_stmt:
+                if isinstance(body_stmt, list):
+                    self.blocks[body_label].extend(body_stmt)
+                else:
+                    self.blocks[body_label].append(body_stmt)
+
+        # Add jump to update block at end of body
+        self.blocks[body_label].append({
+            "type": "ssa_jump",
+            "target": update_label
+        })
+
+        # Save body block variable versions
+        body_final_versions = self.var_versions.copy()
+
+        # Process update block
+        self.current_block = update_label
+        self.blocks[update_label] = []
+        update_versions = body_final_versions.copy()
+        self.var_versions = update_versions
+
+        if stmt['update']:
+            update_stmt = self.convert_statement(stmt['update'])
+            if update_stmt:
+                if isinstance(update_stmt, list):
+                    self.blocks[update_label].extend(update_stmt)
+                else:
+                    self.blocks[update_label].append(update_stmt)
+
+        # Add jump back to header at end of update
+        self.blocks[update_label].append({
+            "type": "ssa_jump",
+            "target": header_label
+        })
+
+        # Save update block variable versions
+        update_final_versions = self.var_versions.copy()
+
+        # Update CFG
+        self.cfg.setdefault(header_label, []).extend([body_label, exit_label])
+        self.cfg.setdefault(body_label, []).append(update_label)
+        self.cfg.setdefault(update_label, []).append(header_label)
+
+        # Identify variables modified in loop body/update
+        modified_vars = set()
+        for var in update_final_versions:
+            if var not in parent_versions or parent_versions[var] != update_final_versions[var]:
+                modified_vars.add(var)
+
+        # Create phi functions for header block
+        phi_statements = []
+        header_phi_vars = {}
+
+        for var in modified_vars:
+            parent_var = f"{var}_{parent_versions.get(var, 0)}"
+            update_var = f"{var}_{update_final_versions[var]}"
+
+            # Create a new version for the header phi
+            new_var = self.fresh_var(var)
+            header_phi_vars[var] = int(new_var.split('_')[1])
+
+            phi_statements.append({
+                "type": "phi",
+                "var": new_var,
+                "sources": {parent_block: parent_var, update_label: update_var}
+            })
+
+        # Insert phi statements at the beginning of header block
+        self.blocks[header_label] = phi_statements + self.blocks[header_label]
+
+        # Set up exit block with the final variable versions
+        self.current_block = exit_label
+        self.blocks[exit_label] = []
+
+        # Merge variable versions from header for exit block
+        for var, version in header_versions.items():
+            if var in header_phi_vars:
+                self.var_versions[var] = header_phi_vars[var]
+            else:
+                self.var_versions[var] = version
+
+        # Update the for statement condition in the parent block
+        ssa_for_stmt["condition"] = condition_ssa
+
+        # Return None since we've already added the for statement to the parent block
+        return None
+
+    def convert_assert(self, stmt):
+        """Convert an assert statement to SSA form."""
+        return {
+            "type": "ssa_assert",
+            "condition": self.convert_expression(stmt['condition'])
+        }
+
+    def convert_expression(self, expr):
+        """Convert an expression to SSA form."""
+        if not expr:
+            return None
+
+        handlers = {
+            'number': lambda e: {'type': 'number', 'value': e['value']},
+            'variable': self.handle_variable,
+            'array_access': self.handle_array_access,
+            'binary': self.handle_binary
+        }
+        return handlers[expr['type']](expr)
+
+    def handle_variable(self, expr):
+        """Handle a variable expression in SSA form."""
+        return {'type': 'variable', 'name': self.get_current_version(expr['name'])}
+
+    def handle_array_access(self, expr):
+        """Handle an array access expression in SSA form."""
+        return {
+            'type': 'array_access',
+            'array': self.get_current_version(expr['array']),
+            'index': self.convert_expression(expr['index'])
+        }
+
+    def handle_binary(self, expr):
+        """Handle a binary expression in SSA form."""
+        return {
+            'type': 'binary',
+            'op': expr['op'],
+            'left': self.convert_expression(expr['left']),
+            'right': self.convert_expression(expr['right'])
+        }
+
+    def get_current_version(self, var_name):
+        """Get the current version of a variable."""
+        if var_name not in self.var_versions:
+            self.var_versions[var_name] = 0
+        return f"{var_name}_{self.var_versions[var_name]}"
+
+
+def pretty_print_ssa(ssa_program, indent=0):
+    """Pretty print the SSA program for debugging."""
+    for block in ssa_program:
+        print('  ' * indent + f"Block: {block['label']}")
+        for stmt in block['statements']:
+            pretty_print_ssa_stmt(stmt, indent + 1)
+
+def pretty_print_ssa_stmt(stmt, indent=0):
+    """Pretty print a single SSA statement."""
+    if stmt['type'] == 'ssa_assign':
+        print('  ' * indent + f"{stmt['var']} := {pretty_expr_str(stmt['expr'])}")
+    elif stmt['type'] == 'ssa_array_assign':
+        print('  ' * indent + f"{stmt['array']} := {stmt['old_array']} with [{pretty_expr_str(stmt['index'])}] = {pretty_expr_str(stmt['value'])}")
+    elif stmt['type'] == 'phi':
+        sources_str = ", ".join([f"{block}: {var}" for block, var in stmt['sources'].items()])
+        print('  ' * indent + f"{stmt['var']} := φ({sources_str})")
+    elif stmt['type'] == 'ssa_if':
+        print('  ' * indent + f"if {pretty_expr_str(stmt['condition'])}")
+        print('  ' * indent + f"  then goto {stmt['then_block']}")
+        print('  ' * indent + f"  else goto {stmt['else_block']}")
+        print('  ' * indent + f"join at {stmt['join_block']}")
+    elif stmt['type'] == 'ssa_condition':
+        print('  ' * indent + f"if {pretty_expr_str(stmt['condition'])}")
+        print('  ' * indent + f"  then goto {stmt['true_target']}")
+        print('  ' * indent + f"  else goto {stmt['false_target']}")
+    elif stmt['type'] == 'ssa_jump':
+        print('  ' * indent + f"goto {stmt['target']}")
+    elif stmt['type'] == 'ssa_while':
+        print('  ' * indent + f"while [{stmt['header_block']}] {pretty_expr_str(stmt.get('condition', 'condition in header'))}")
+        print('  ' * indent + f"  body {stmt['body_block']}")
+        print('  ' * indent + f"  exit {stmt['exit_block']}")
+    elif stmt['type'] == 'ssa_for':
+        print('  ' * indent + "for")
+        print('  ' * (indent + 1) + f"condition [{stmt['header_block']}]: {pretty_expr_str(stmt.get('condition', 'condition in header'))}")
+        print('  ' * (indent + 1) + f"body: {stmt['body_block']}")
+        print('  ' * (indent + 1) + f"update: {stmt['update_block']}")
+        print('  ' * (indent + 1) + f"exit: {stmt['exit_block']}")
+    elif stmt['type'] == 'ssa_assert':
+        print('  ' * indent + f"assert {pretty_expr_str(stmt['condition'])}")
+    else:
+        print('  ' * indent + f"Unknown statement type: {stmt['type']}")
+
+def pretty_expr_str(expr):
+    """Convert an expression to a string for pretty printing."""
+    if not expr:
+        return "None"
+    if expr['type'] == 'number':
+        return str(expr['value'])
+    elif expr['type'] == 'variable':
+        return expr['name']
+    elif expr['type'] == 'array_access':
+        return f"{expr['array']}[{pretty_expr_str(expr['index'])}]"
+    elif expr['type'] == 'binary':
+        return f"({pretty_expr_str(expr['left'])} {expr['op']} {pretty_expr_str(expr['right'])})"
+    else:
+        return f"Unknown expression type: {expr['type']}"# improved unroll
+import copy
+
+def pretty_expr_str(expr):
+    """Convert an expression to a pretty string."""
+    if expr['type'] == 'number':
+        return str(expr['value'])
+    
+    elif expr['type'] == 'variable':
+        return expr['name']
+    
+    elif expr['type'] == 'binary':
+        left = pretty_expr_str(expr['left'])
+        right = pretty_expr_str(expr['right'])
+        return f"({left} {expr['op']} {right})"
+    
+    elif expr['type'] == 'array_access':
+        array = expr['array']
+        index = pretty_expr_str(expr['index'])
+        return f"{array}[{index}]"
+    
+    else:
+        return f"<{expr['type']}>"
+
+class LoopUnroller:
+    def __init__(self, parser):
+        self.parser = parser
+        self.unroll_depth = 3  # Default unroll depth
+
+    def set_unroll_depth(self, depth):
+        self.unroll_depth = depth
+
+    def unroll_program(self, program):
+        unrolled = []
+
+        for stmt in program:
+        
+            if stmt['type'] == 'while':
+                unrolled.extend(self.unroll_while_loop(stmt))
+        
+            elif stmt['type'] == 'for':
+                unrolled.extend(self.unroll_for_loop(stmt))
+        
+            elif stmt['type'] == 'if':
+                then_block = self.unroll_program(stmt['then_block'])
+                else_block = self.unroll_program(stmt['else_block'])
+                unrolled.append({
+                    'type': 'if',
+                    'condition': stmt['condition'],
+                    'then_block': then_block,
+                    'else_block': else_block
+                })
+        
+            else:
+                unrolled.append(stmt)  # Handle other statement types directly
+
+        return unrolled
+
+    def unroll_while_loop(self, loop):
+        result = []
+        condition = loop['condition']
+        body = loop['body']
+
+        # Create a sequence of if conditions for each iteration
+        for i in range(self.unroll_depth):
+            # Add if-statement for this iteration
+            if_block = {
+                'type': 'if',
+                'condition': copy.deepcopy(condition),
+                'then_block': self.unroll_program(copy.deepcopy(body)),
+                'else_block': []  # No else needed for while
+            }
+            result.append(if_block)
+            
+            # For the final iteration, add an assertion that the loop condition is false
+            # to model the loop termination
+            if i == self.unroll_depth - 1:
+                # Create a negated condition for the assertion
+                negated_condition = self.negate_condition(copy.deepcopy(condition))
+                result.append({
+                    'type': 'assert',
+                    'condition': negated_condition
+                })
+
+        return result
+
+    def unroll_for_loop(self, loop):
+        result = []
+        init = loop['init']
+        condition = loop['condition']
+        update = loop['update']
+        body = loop['body']
+
+        # Add initialization
+        if init:
+            result.append(init)
+
+        # Create a sequence of if conditions for each iteration
+        for i in range(self.unroll_depth):
+            # Add if-statement for this iteration
+            unrolled_body = self.unroll_program(copy.deepcopy(body))
+            
+            if_block = {
+                'type': 'if',
+                'condition': copy.deepcopy(condition),
+                'then_block': unrolled_body + [copy.deepcopy(update)] if update else unrolled_body,
+                'else_block': []  # No else needed for for
+            }
+            result.append(if_block)
+            
+            # For the final iteration, add an assertion that the loop condition is false
+            # to model the loop termination
+            if i == self.unroll_depth - 1:
+                # Create a negated condition for the assertion
+                negated_condition = self.negate_condition(copy.deepcopy(condition))
+                result.append({
+                    'type': 'assert',
+                    'condition': negated_condition
+                })
+
+        return result
+
+    def negate_condition(self, condition):
+        """Negate a condition expression."""
+        if condition['type'] == 'binary':
+            # Invert comparison operators
+            op_map = {
+                '==': '!=',
+                '!=': '==',
+                '<': '>=',
+                '>': '<=',
+                '<=': '>',
+                '>=': '<'
+            }
+            
+            if condition['op'] in op_map:
+                # Directly negate by changing the operator
+                condition['op'] = op_map[condition['op']]
+                return condition
+        
+        # For more complex conditions, create a new binary expression with a '!=' operator
+        return {
+            'type': 'binary',
+            'op': '==',
+            'left': condition,
+            'right': {'type': 'number', 'value': 0}
+        }
+
+    def pretty_print_unrolled_program(self, program, indent=0):
+        """Pretty print the unrolled program."""
+        for stmt in program:
+            if stmt['type'] == 'assign':
+                print(' ' * indent + f"{stmt['var']} := {pretty_expr_str(stmt['expr'])};")
+        
+            elif stmt['type'] == 'array_assign':
+                print(' ' * indent + f"{stmt['array']}[{pretty_expr_str(stmt['index'])}] := {pretty_expr_str(stmt['value'])};")
+        
+            elif stmt['type'] == 'if':
+                print(' ' * indent + f"if ({pretty_expr_str(stmt['condition'])}) {{")
+                self.pretty_print_unrolled_program(stmt['then_block'], indent + 4)
+                print(' ' * indent + "}")
+        
+                if stmt['else_block']:
+                    print(' ' * indent + "else {")
+                    self.pretty_print_unrolled_program(stmt['else_block'], indent + 4)
+                    print(' ' * indent + "}")
+        
+            elif stmt['type'] == 'while':
+                print(' ' * indent + f"while ({pretty_expr_str(stmt['condition'])}) {{")
+                self.pretty_print_unrolled_program(stmt['body'], indent + 4)
+                print(' ' * indent + "}")
+        
+            elif stmt['type'] == 'for':
+                print(' ' * indent + "for (", end="")
+        
+                if stmt['init']:
+                    if stmt['init']['type'] == 'assign':
+                        print(f"{stmt['init']['var']} := {pretty_expr_str(stmt['init']['expr'])}", end="")
+        
+                print("; ", end="")
+                print(f"{pretty_expr_str(stmt['condition'])}; ", end="")
+        
+                if stmt['update'] and stmt['update']['type'] == 'assign':
+                    print(f"{stmt['update']['var']} := {pretty_expr_str(stmt['update']['expr'])}", end="")
+        
+                print(") {")
+                self.pretty_print_unrolled_program(stmt['body'], indent + 4)
+                print(' ' * indent + "}")
+        
+            elif stmt['type'] == 'assert':
+                print(' ' * indent + f"assert({pretty_expr_str(stmt['condition'])});")
+        
+            else:
+                print(' ' * indent + f"// Unsupported statement type: {stmt['type']}")# verify.py
+"""
+Program verification using Z3 SMT solver.
+This module handles:
+1. Verifying assertions in a program
+2. Checking semantic equivalence between two programs
+"""
+import sys
+import subprocess
+import tempfile
+import os
+from Parser import Parser
+from ssa_converter import SSAConverter, pretty_print_ssa
+from smt_converter import generate_smt_lib
+from Unroll import LoopUnroller
+
+# Try to import Z3 at the top level to detect availability early
+try:
+    import z3
+    Z3_AVAILABLE = True
+except ImportError:
+    Z3_AVAILABLE = False
+
+class ProgramVerifier:
+    def __init__(self):
+        self.parser = Parser()
+        self.unroller = LoopUnroller(self.parser) 
+        self.converter = SSAConverter()
+        self.unroll_depth = 3  # Default unroll depth
+        
+    def set_unroll_depth(self, depth):
+        """Set the loop unrolling depth"""
+        self.unroll_depth = depth
+        self.unroller.set_unroll_depth(depth)
+        
+    def verify_file(self, filename):
+        """Verify a program from a file"""
+        with open(filename, 'r') as f:
+            program_code = f.read()
+        return self.verify_program(program_code)
+    
+    def verify_program(self, smt_lib):
+      """Verify assertions in a program"""        
+      try:
+          z3_result = self._check_with_z3(smt_lib)
+          
+          if 'error' in z3_result:
+              return {'status': 'error', 'message': z3_result['error']}
+          
+          # Correct interpretation:
+          # - If UNSAT: Assertion holds (no counterexample to its negation)
+          # - If SAT: Assertion fails (counterexample exists)
+          if z3_result['sat'] == 'unsat':
+              return {'status': 'success', 'message': 'All assertions hold'}
+          elif z3_result['sat'] == 'sat':
+              return {
+                  'status': 'failed', 
+                  'message': 'Assertion failed',
+                  'counterexample': z3_result.get('model', {})
+              }
+          else:
+              return {'status': 'unknown', 'message': 'Verification inconclusive'}
+              
+      except Exception as e:
+          return {'status': 'error', 'message': str(e)}
+    
+    def check_equivalence(self, program1_code, program2_code):
+        """Check if two programs are semantically equivalent"""
+        # Parse both programs
+        ast1 = self.parser.parse_program(program1_code)
+        ast2 = self.parser.parse_program(program2_code)
+        
+        # Identify all variables in both programs
+        program1_vars = self._extract_variables(ast1)
+        program2_vars = self._extract_variables(ast2)
+        all_vars = program1_vars.union(program2_vars)
+        
+        # Unroll loops in both programs
+        self.unroller.set_unroll_depth(self.unroll_depth)
+        unrolled_ast1 = self.unroller.unroll_program(ast1)
+        unrolled_ast2 = self.unroller.unroll_program(ast2)
+        
+        # Convert both to SSA form
+        ssa_program1 = self.converter.convert_program(unrolled_ast1)
+        ssa_program2 = self.converter.convert_program(unrolled_ast2)
+        
+        # Generate SMT-LIB for checking equivalence
+        smt_lib = self._generate_equivalence_smt(ssa_program1, ssa_program2, all_vars)
+        
+        # Check equivalence with Z3
+        result = self._check_with_z3(smt_lib)
+        
+        if 'error' in result:
+            return {'equivalent': False, 
+                    'message': f'Error during equivalence check: {result["error"]}'}
+            
+        if 'sat' not in result:
+            return {'equivalent': False, 
+                    'message': 'Unknown error during SMT solving'}
+
+        
+        
+        if result['sat'] == 'unsat':
+            return {'equivalent': True, 'message': 'Programs are semantically equivalent'}
+        else:
+            return {'equivalent': False, 
+                    'message': 'Programs are not equivalent', 
+                    'counterexample': result.get('model', {})}
+    
+    def _extract_variables(self, ast):
+        """Extract all variables used in a program"""
+        variables = set()
+        
+        def process_node(node):
+            if isinstance(node, dict):
+                # Handle variable assignments
+                if node.get('type') == 'assign':
+                    variables.add(node['var'])
+                    process_node(node['expr'])
+                # Handle variable references in expressions
+                elif node.get('type') == 'variable':
+                    variables.add(node['name'])
+                # Handle array assignments
+                elif node.get('type') == 'array_assign':
+                    variables.add(node['array'])
+                    process_node(node['index'])
+                    process_node(node['value'])
+                # Handle array accesses
+                elif node.get('type') == 'array_access':
+                    variables.add(node['array'])
+                    process_node(node['index'])
+                # Handle binary operations
+                elif node.get('type') == 'binary':
+                    process_node(node['left'])
+                    process_node(node['right'])
+                # Handle if statements
+                elif node.get('type') == 'if':
+                    process_node(node['condition'])
+                    for stmt in node['then_block']:
+                        process_node(stmt)
+                    for stmt in node['else_block']:
+                        process_node(stmt)
+                # Handle while loops
+                elif node.get('type') == 'while':
+                    process_node(node['condition'])
+                    for stmt in node['body']:
+                        process_node(stmt)
+                # Handle for loops
+                elif node.get('type') == 'for':
+                    if node['init']:
+                        process_node(node['init'])
+                    process_node(node['condition'])
+                    if node['update']:
+                        process_node(node['update'])
+                    for stmt in node['body']:
+                        process_node(stmt)
+                # Handle assert statements
+                elif node.get('type') == 'assert':
+                    process_node(node['condition'])
+        
+        # Process each statement in the AST
+        for stmt in ast:
+            process_node(stmt)
+            
+        return variables
+    
+    def _generate_equivalence_smt(self, ssa_program1, ssa_program2, variables):
+        """Generate SMT-LIB code for checking program equivalence"""
+        # Get SMT-LIB for each program
+        smt1 = generate_smt_lib(ssa_program1)
+        smt2 = generate_smt_lib(ssa_program2)
+        
+        # Extract the variable declarations and constraints
+        smt1_lines = smt1.strip().split('\n')
+        smt2_lines = smt2.strip().split('\n')
+        
+        # Get declarations from program 1
+        declarations1 = [line for line in smt1_lines if line.startswith('(declare-const')]
+        constraints1 = [line for line in smt1_lines if line.startswith('(assert')]
+        
+        # Get declarations from program 2, renaming variables to avoid conflicts
+        declarations2 = []
+        constraints2 = []
+        var_mapping = {}
+        
+        for line in smt2_lines:
+            if line.startswith('(declare-const'):
+                # Extract variable name
+                var = line.split()[1]
+                # Create a renamed version
+                renamed_var = f"{var}_p2"
+                var_mapping[var] = renamed_var
+                # Add the renamed declaration
+                declarations2.append(f"(declare-const {renamed_var} Int)")
+            elif line.startswith('(assert'):
+                constraints2.append(line)
+        
+        # Rename variables in program 2 constraints
+        for i, constraint in enumerate(constraints2):
+            for var, renamed in var_mapping.items():
+                # Replace variable names, being careful with word boundaries
+                constraint = constraint.replace(f" {var} ", f" {renamed} ")
+                constraint = constraint.replace(f" {var})", f" {renamed})")
+                constraint = constraint.replace(f"({var} ", f"({renamed} ")
+                constraint = constraint.replace(f"({var})", f"({renamed})")
+            constraints2[i] = constraint
+        
+        # Generate assertions for equality of output variables
+        equality_assertions = []
+        output_vars = self._identify_output_vars(ssa_program1, ssa_program2)
+        
+        for var in output_vars:
+            # Find the SSA version of each output variable in program 1
+            p1_versions = [decl.split()[1] for decl in declarations1 
+                          if decl.split()[1].startswith(f"{var}_")]
+            if p1_versions:
+                p1_final = max(p1_versions, key=lambda x: int(x.split('_')[-1]))
+                
+                # Find the SSA version of the same variable in program 2
+                p2_versions = [var_mapping.get(decl.split()[1], "") for decl in declarations2 
+                              if decl.split()[1].startswith(f"{var}_")]
+                filtered_versions = [v for v in p2_versions if v]
+                if filtered_versions:
+                    p2_final = max(filtered_versions, key=lambda x: int(x.split('_')[-1]))                    
+                    # Assert that the final values are equal
+                    equality_assertions.append(f"(assert (= {p1_final} {p2_final}))")
+        
+        # Construct the final SMT-LIB for equivalence checking
+        combined_smt = [
+            "(set-logic QF_AUFLIA)",
+            "",
+            # Variable declarations
+            *declarations1,
+            *declarations2,
+            "",
+            # Constraints from both programs
+            *constraints1,
+            *constraints2,
+            "",
+            # Assert the negation of equivalence (to check for satisfiability)
+            # If at least one output variable differs, they're not equivalent
+            f"(assert (not (and {' '.join(equality_assertions)})))",
+            "",
+            "(check-sat)",
+            "(get-model)"
+        ]
+        
+        return "\n".join(combined_smt)
+    
+    def _identify_output_vars(self, ssa_program1, ssa_program2):
+        """Identify output variables (those that are assigned values)"""
+        # For simplicity, treat all variables as potential outputs
+        output_vars = set()
+        
+        # Extract base variable names from SSA variables
+        def extract_vars_from_block(block):
+            vars_in_block = set()
+            for stmt in block["statements"]:
+                if stmt["type"] == "ssa_assign":
+                    # Extract base variable name (without SSA index)
+                    base_var = stmt["var"].split('_')[0]
+                    vars_in_block.add(base_var)
+                elif stmt["type"] == "ssa_array_assign":
+                    base_var = stmt["array"].split('_')[0]
+                    vars_in_block.add(base_var)
+            return vars_in_block
+        
+        # Process each block in both programs
+        for block in ssa_program1:
+            output_vars.update(extract_vars_from_block(block))
+            
+        for block in ssa_program2:
+            output_vars.update(extract_vars_from_block(block))
+            
+        return output_vars
+    
+    def _check_with_z3(self, smt_lib):
+        """Run Z3 using the Python API with proper error handling"""
+        temp_filename = None
+        
+        # Use Python Z3 API if available
+        if Z3_AVAILABLE:
+            try:
+                solver = z3.Solver()
+                solver.from_string(smt_lib)
+                result = solver.check()
+                
+                if result == z3.unsat:
+                    return {'sat': 'unsat'}
+                elif result == z3.sat:
+                    model = solver.model()
+                    # Convert model to a readable dictionary
+                    model_dict = {}
+                    for decl in model.decls():
+                        try:
+                            # Try to get integer value first
+                            model_dict[decl.name()] = model[decl].as_long()
+                        except:
+                            # Fall back to string representation
+                            model_dict[decl.name()] = str(model[decl])
+                    return {
+                        'sat': 'sat',
+                        'model': model_dict
+                    }
+                else:
+                    return {'sat': 'unknown'}
+            except Exception as e:
+                return {'error': f'Z3 Python API error: {str(e)}'}
+        
+        # Fall back to command-line Z3 if Python API not available
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.smt2', delete=False) as temp:
+                temp.write(smt_lib)
+                temp_filename = temp.name
+            
+            # Check if Z3 command exists - look for z3 on Unix/Linux and z3.exe on Windows
+            z3_cmd = 'z3.exe' if os.name == 'nt' else 'z3'
+            result = subprocess.run([z3_cmd, temp_filename], 
+                                capture_output=True, 
+                                text=True)
+            
+            # Check if Z3 command line exists
+            if result.returncode == 127 or (os.name == 'nt' and result.returncode == 1):  # Command not found
+                return {'error': f'{z3_cmd} executable not found in path. Please ensure it is properly installed and in your PATH.'}
+                
+            output = result.stdout.strip()
+            
+            if output.startswith('sat'):
+                model_lines = output.split('\n')[1:]
+                return {
+                    'sat': 'sat',
+                    'model': self._parse_z3_model(model_lines)
+                }
+            elif output.startswith('unsat'):
+                return {'sat': 'unsat'}
+            else:
+                return {'sat': 'unknown', 'output': output}
+                
+        except FileNotFoundError:
+            return {'error': 'Neither z3-solver Python package nor z3 executable found.\n'
+                        'Please ensure z3 or z3.exe is in your PATH, or install:\n'
+                        '  pip install z3-solver (for Python API)'}
+        except Exception as e:
+            return {'error': f'Z3 command-line error: {str(e)}'}
+        finally:
+            if temp_filename and os.path.exists(temp_filename):
+                os.remove(temp_filename)
+    
+    def _parse_z3_model(self, model_lines):
+        """Parse Z3's model output into a Python dictionary"""
+        model = {}
+        current_var = None
+        
+        for line in model_lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Check if this is a variable definition
+            if line.startswith('(define-fun'):
+                # Extract variable name
+                current_var = line.split()[1]
+                # If it's an SSA variable, get the base name
+                if '_' in current_var:
+                    base_var = current_var.split('_')[0]
+                else:
+                    base_var = current_var
+                
+                # Extract value if it's on the same line
+                if "-> Int" in line and line.endswith(")"):
+                    value = line.split()[-2]
+                    try:
+                        model[base_var] = int(value)
+                    except ValueError:
+                        model[base_var] = value
+                        
+            # If the value is on the next line
+            elif current_var and line.isdigit() or line.startswith('-'):
+                base_var = current_var.split('_')[0] if '_' in current_var else current_var
+                try:
+                    model[base_var] = int(line)
+                except ValueError:
+                    model[base_var] = line
+                current_var = None
+                
+        return model
+
+
+'''def main():
+    verifier = ProgramVerifier()
+    
+    if len(sys.argv) < 2:
+        print("Usage:")
+        print("  verify.py verify <program.txt> [unroll_depth]")
+        print("  verify.py equiv <program1.txt> <program2.txt> [unroll_depth]")
+        return
+
+    command = sys.argv[1]
+    
+    # Set unroll depth if provided
+    if command == "verify" and len(sys.argv) > 3:
+        verifier.set_unroll_depth(int(sys.argv[3]))
+    elif command == "equiv" and len(sys.argv) > 4:
+        verifier.set_unroll_depth(int(sys.argv[4]))
+        
+    if command == "verify":
+        if len(sys.argv) < 3:
+            print("Error: Missing program file")
+            return
+            
+        program_file = sys.argv[2]
+        print(f"Verifying program: {program_file}")
+        result = verifier.verify_file(program_file)
+        
+        if result['status'] == 'error':
+            print(f"Error: {result['message']}")
+        elif result['status'] == 'success':
+            print("Verification successful! All assertions hold.")
+        elif result['status'] == 'failed':
+            print("Verification failed! Found counterexample:")
+            for var, value in result['counterexample'].items():
+                print(f"  {var} = {value}")
+        else:
+            print(f"Verification inconclusive: {result['message']}")
+            
+    elif command == "equiv":
+        if len(sys.argv) < 4:
+            print("Error: Missing program files")
+            return
+            
+        program1_file = sys.argv[2]
+        program2_file = sys.argv[3]
+        print(f"Checking equivalence between: {program1_file} and {program2_file}")
+        
+        with open(program1_file, 'r') as f:
+            program1_code = f.read()
+        with open(program2_file, 'r') as f:
+            program2_code = f.read()
+            
+        result = verifier.check_equivalence(program1_code, program2_code)
+        
+        if result['equivalent']:
+            print("Programs are semantically equivalent!")
+        else:
+            print("Programs are NOT equivalent!")
+            if 'counterexample' in result:
+                print("Counterexample:")
+                for var, value in result['counterexample'].items():
+                    print(f"  {var} = {value}")
+    else:
+        print(f"Unknown command: {command}")
+        
+if __name__ == "__main__":
+    main() '''

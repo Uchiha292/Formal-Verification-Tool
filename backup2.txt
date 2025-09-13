@@ -1,0 +1,145 @@
+import tkinter as tk
+from tkinter import ttk
+from graphviz import Digraph
+from PIL import Image, ImageTk
+import os
+
+def run\_verification():
+\# Clear outputs
+ssa\_panel.delete("1.0", tk.END)
+smt\_panel.delete("1.0", tk.END)
+results\_panel.delete("1.0", tk.END)
+
+```
+code = verification_input.get("1.0", tk.END).strip()
+
+if not code:
+    results_panel.insert(tk.END, "Error: No input provided.")
+    return
+
+# Dummy SSA and SMT output
+ssa_output = "x_1 = 3"
+smt_output = "(declare-const x_1 Int)\n(assert (> x_1 0))"
+
+ssa_panel.insert(tk.END, f"SSA Form:\n{ssa_output}")
+smt_panel.insert(tk.END, smt_output)
+results_panel.insert(tk.END, "Result: ✅ Assertion holds")
+
+draw_cfg(code)
+```
+
+def draw\_cfg(code):
+dot = Digraph(format='png')
+lines = \[line.strip() for line in code.split('\n') if line.strip()]
+if not lines:
+return
+for i, line in enumerate(lines):
+dot.node(f'N{i}', line)
+if i > 0:
+dot.edge(f'N{i-1}', f'N{i}')
+dot.render('cfg', cleanup=True)
+cfg\_img = Image.open("cfg.png")
+cfg\_img = cfg\_img.resize((500, 350), Image.Resampling.LANCZOS)
+cfg\_photo = ImageTk.PhotoImage(cfg\_img)
+cfg\_canvas.create\_image(0, 0, anchor='nw', image=cfg\_photo)
+cfg\_canvas.image = cfg\_photo  # Prevent garbage collection
+
+# === Initialize Window ===
+
+window = tk.Tk()
+window\.title("Formal Verification Tool")
+window\.geometry("1300x900")
+window\.configure(bg="#f0f0f0")
+
+# === Fonts ===
+
+code\_font = ("Courier", 10)
+label\_font = ("Helvetica", 11, "bold")
+
+# === Mode Selection ===
+
+top\_frame = tk.Frame(window, bg="#f0f0f0")
+top\_frame.pack(fill="x", pady=5)
+
+mode = tk.StringVar(value="verification")
+
+def toggle\_mode():
+if mode.get() == "verification":
+verification\_input.pack(fill="both", expand=True)
+equiv\_input1.pack\_forget()
+equiv\_input2.pack\_forget()
+else:
+verification\_input.pack\_forget()
+equiv\_input1.pack(side="left", fill="both", expand=True)
+equiv\_input2.pack(side="left", fill="both", expand=True)
+
+tk.Radiobutton(top\_frame, text="Verification", variable=mode, value="verification", command=toggle\_mode, bg="#f0f0f0").pack(side="left", padx=10)
+tk.Radiobutton(top\_frame, text="Equivalence", variable=mode, value="equivalence", command=toggle\_mode, bg="#f0f0f0").pack(side="left")
+
+# === Input Frame ===
+
+input\_frame = tk.Frame(window)
+input\_frame.pack(fill="both", expand=True, padx=10)
+
+verification\_input = tk.Text(input\_frame, height=12, font=code\_font, bg="#ffffff")
+verification\_input.pack(fill="both", expand=True)
+
+equiv\_input1 = tk.Text(input\_frame, height=12, font=code\_font, bg="#ffffff")
+equiv\_input2 = tk.Text(input\_frame, height=12, font=code\_font, bg="#ffffff")
+equiv\_input1.pack\_forget()
+equiv\_input2.pack\_forget()
+
+# === Output Frame ===
+
+output\_frame = tk.Frame(window)
+output\_frame.pack(fill="both", expand=True, padx=10)
+
+ssa\_label = tk.Label(output\_frame, text="SSA Panel", font=label\_font)
+ssa\_label.grid(row=0, column=0, sticky="w")
+ssa\_panel = tk.Text(output\_frame, height=10, font=code\_font, bg="#f9f9f9")
+ssa\_panel.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+
+smt\_label = tk.Label(output\_frame, text="SMT Panel", font=label\_font)
+smt\_label.grid(row=0, column=1, sticky="w")
+smt\_panel = tk.Text(output\_frame, height=10, font=code\_font, bg="#f9f9f9")
+smt\_panel.grid(row=1, column=1, sticky="nsew", padx=5, pady=5)
+
+results\_label = tk.Label(output\_frame, text="Results", font=label\_font)
+results\_label.grid(row=2, column=0, sticky="w", columnspan=2)
+results\_panel = tk.Text(output\_frame, height=6, font=code\_font, bg="#e6f2e6")
+results\_panel.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=5, pady=5)
+
+output\_frame.grid\_columnconfigure(0, weight=1)
+output\_frame.grid\_columnconfigure(1, weight=1)
+
+# === CFG Panel ===
+
+cfg\_label = tk.Label(window, text="Control Flow Graph (CFG)", font=label\_font)
+cfg\_label.pack(pady=5)
+cfg\_canvas = tk.Canvas(window, width=500, height=350, bg="white", bd=2, relief="sunken")
+cfg\_canvas.pack(pady=10)
+
+# === Bottom Controls ===
+
+bottom\_frame = tk.Frame(window, bg="#f0f0f0")
+bottom\_frame.pack(fill="x", pady=10)
+
+tk.Button(top\_frame, text="Run Verification", command=run\_verification, bg="#4CAF50", fg="white", font=label\_font).pack(side="right", padx=10)
+def clear_all():
+    verification_input.delete("1.0", tk.END)
+    equiv_input1.delete("1.0", tk.END)
+    equiv_input2.delete("1.0", tk.END)
+    ssa_panel.delete("1.0", tk.END)
+    smt_panel.delete("1.0", tk.END)
+    results_panel.delete("1.0", tk.END)
+    cfg_canvas.delete("all")
+
+tk.Button(top_frame, text="Clear All", command=clear_all, bg="#f44336", fg="white", font=label_font).pack(side="right", padx=10)
+
+tk.Label(bottom\_frame, text="Unroll Depth:", bg="#f0f0f0").pack(side="left", padx=5)
+unroll\_var = tk.IntVar(value=3)
+tk.Spinbox(bottom\_frame, from\_=1, to=10, textvariable=unroll\_var, width=5).pack(side="left")
+
+window\.mainloop()
+
+

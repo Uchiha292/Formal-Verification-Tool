@@ -1,0 +1,318 @@
+import tkinter as tk
+from tkinter import ttk
+from graphviz import Digraph
+from PIL import Image, ImageTk
+import os
+import sys
+
+# Import backend modules
+try:
+    from Parser import Parser
+    from ssa_converter import SSAConverter, pretty_print_ssa
+    from smt_converter import generate_smt_lib
+    from Unroll import LoopUnroller
+    from verify import ProgramVerifier
+except ImportError as e:
+    print(f"Error importing backend modules: {e}")
+    sys.exit(1)
+
+class FormalVerificationGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Formal Verification Tool")
+        self.root.geometry("1300x900")
+        self.root.configure(bg="#f0f0f0")
+
+        # Fonts
+        self.code_font = ("Courier", 10)
+        self.label_font = ("Helvetica", 11, "bold")
+
+        self.setup_gui()
+
+    def setup_gui(self):
+        # Create main canvas for application-wide scrolling
+        main_canvas = tk.Canvas(self.root, bg="#f0f0f0")
+        v_scrollbar = tk.Scrollbar(self.root, orient="vertical", command=main_canvas.yview)
+        main_canvas.configure(yscrollcommand=v_scrollbar.set)
+
+        # Pack scrollbars and canvas
+        v_scrollbar.pack(side="right", fill="y")
+        main_canvas.pack(side="left", fill="both", expand=True)
+
+        # Create a frame inside the canvas to hold all widgets
+        self.main_frame = tk.Frame(main_canvas, bg="#f0f0f0")
+        main_canvas.create_window((0, 0), window=self.main_frame, anchor="nw")
+
+        # Update scroll region when frame size changes
+        self.main_frame.bind("<Configure>", lambda e: main_canvas.configure(scrollregion=main_canvas.bbox("all")))
+
+        # Mode Selection and Controls
+        top_frame = tk.Frame(self.main_frame, bg="#f0f0f0")
+        top_frame.pack(fill="x", pady=5)
+
+        self.mode = tk.StringVar(value="verification")
+        tk.Radiobutton(top_frame, text="Verification", variable=self.mode, value="verification",
+                       command=self.toggle_mode, bg="#f0f0f0").pack(side="left", padx=10)
+        tk.Radiobutton(top_frame, text="Equivalence", variable=self.mode, value="equivalence",
+                       command=self.toggle_mode, bg="#f0f0f0").pack(side="left", padx=10)
+
+        # Unroll Depth
+        tk.Label(top_frame, text="Unroll Depth:", bg="#f0f0f0").pack(side="left", padx=5)
+        self.unroll_var = tk.IntVar(value=3)
+        tk.Spinbox(top_frame, from_=1, to=10, textvariable=self.unroll_var, width=5).pack(side="left", padx=5)
+
+        # Action Buttons
+        tk.Button(top_frame, text="Run Verification", command=self.run_verification,
+                  bg="#4CAF50", fg="white", font=self.label_font).pack(side="right", padx=10)
+        tk.Button(top_frame, text="Clear All", command=self.clear_all,
+                  bg="#f44336", fg="white", font=self.label_font).pack(side="right", padx=10)
+
+        # Input Frame
+        input_frame = tk.Frame(self.main_frame)
+        input_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.verification_input = tk.Text(input_frame, height=12, font=self.code_font, bg="#ffffff")
+        self.verification_input.pack(fill="both", expand=True)
+
+        self.equiv_input1 = tk.Text(input_frame, height=12, font=self.code_font, bg="#ffffff")
+        self.equiv_input2 = tk.Text(input_frame, height=12, font=self.code_font, bg="#ffffff")
+        self.equiv_input1.pack_forget()
+        self.equiv_input2.pack_forget()
+
+        # Output Frame
+        output_frame = tk.Frame(self.main_frame)
+        output_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        ssa_label = tk.Label(output_frame, text="SSA Panel", font=self.label_font)
+        ssa_label.grid(row=0, column=0, sticky="w")
+        self.ssa_panel = tk.Text(output_frame, height=10, font=self.code_font, bg="#f9f9f9")
+        self.ssa_panel.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+
+        smt_label = tk.Label(output_frame, text="SMT Panel", font=self.label_font)
+        smt_label.grid(row=0, column=1, sticky="w")
+        self.smt_panel = tk.Text(output_frame, height=10, font=self.code_font, bg="#f9f9f9")
+        self.smt_panel.grid(row=1, column=1, sticky="nsew", padx=5, pady=5)
+
+        results_label = tk.Label(output_frame, text="Results", font=self.label_font)
+        results_label.grid(row=2, column=0, sticky="w", columnspan=2)
+        self.results_panel = tk.Text(output_frame, height=6, font=self.code_font, bg="#e6f2e6")
+        self.results_panel.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=5, pady=5)
+
+        output_frame.grid_columnconfigure(0, weight=1)
+        output_frame.grid_columnconfigure(1, weight=1)
+
+        # CFG Panel
+        cfg_label = tk.Label(self.main_frame, text="Control Flow Graph (CFG)", font=self.label_font)
+        cfg_label.pack(pady=5)
+        self.cfg_image_label = tk.Label(self.main_frame, bg="#f0f0f0")
+        self.cfg_image_label.pack(pady=5)
+
+        # Enable mouse wheel scrolling
+        self.root.bind("<MouseWheel>", lambda e: main_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+        self.root.bind("<Button-4>", lambda e: main_canvas.yview_scroll(-1, "units"))
+        self.root.bind("<Button-5>", lambda e: main_canvas.yview_scroll(1, "units"))
+
+    def toggle_mode(self):
+        if self.mode.get() == "verification":
+            self.verification_input.pack(fill="both", expand=True)
+            self.equiv_input1.pack_forget()
+            self.equiv_input2.pack_forget()
+        else:
+            self.verification_input.pack_forget()
+            self.equiv_input1.pack(side="left", fill="both", expand=True)
+            self.equiv_input2.pack(side="left", fill="both", expand=True)
+
+    def run_verification(self):
+        # Clear outputs
+        self.ssa_panel.delete("1.0", tk.END)
+        self.smt_panel.delete("1.0", tk.END)
+        self.results_panel.delete("1.0", tk.END)
+        self.cfg_image_label.configure(image='')
+
+        verifier = ProgramVerifier()
+        unroll_depth = self.unroll_var.get()
+        verifier.set_unroll_depth(unroll_depth)
+
+        if self.mode.get() == "verification":
+            code = self.verification_input.get("1.0", tk.END).strip()
+            if not code:
+                self.results_panel.insert(tk.END, "Error: No input provided.")
+                return
+
+            try:
+                # Parse the program
+                parser = Parser()
+                ast = parser.parse_program(code)
+
+                # Unroll loops
+                unroller = LoopUnroller(parser)
+                unroller.set_unroll_depth(unroll_depth)
+                unrolled_ast = unroller.unroll_program(ast)
+
+                # Convert to SSA
+                converter = SSAConverter()
+                ssa_program = converter.convert_program(unrolled_ast)
+
+                # Generate SMT-LIB
+                smt_output = generate_smt_lib(ssa_program)
+
+                # Capture SSA output for display
+                ssa_output = []
+                def capture_ssa(*args):
+                    ssa_output.append(" ".join(map(str, args)) + "\n")
+                original_print = print
+                globals()['print'] = capture_ssa
+                pretty_print_ssa(ssa_program)
+                globals()['print'] = original_print
+                ssa_text = "".join(ssa_output)
+
+                # Display outputs
+                self.ssa_panel.insert(tk.END, f"SSA Form:\n{ssa_text}")
+                self.smt_panel.insert(tk.END, smt_output)
+
+                # Verify the program
+                result = verifier.verify_program(smt_output)
+                if result['status'] == 'success':
+                    self.results_panel.insert(tk.END, "✓ All assertions hold")
+                elif result['status'] == 'failed':
+                    self.results_panel.insert(tk.END, "✗ Assertion failed\nCounterexample:\n")
+                    for var, value in result.get('counterexample', {}).items():
+                        self.results_panel.insert(tk.END, f"  {var} = {value}\n")
+                elif result['status'] == 'error':
+                    self.results_panel.insert(tk.END, f"Error: {result['message']}")
+                else:
+                    self.results_panel.insert(tk.END, f"Verification inconclusive: {result['message']}")
+
+                # Draw CFG
+                self.draw_cfg(converter.cfg, ssa_program)
+
+            except Exception as e:
+                self.results_panel.insert(tk.END, f"Error during verification: {str(e)}")
+
+        elif self.mode.get() == "equivalence":
+            code1 = self.equiv_input1.get("1.0", tk.END).strip()
+            code2 = self.equiv_input2.get("1.0", tk.END).strip()
+
+            if not code1 or not code2:
+                self.results_panel.insert(tk.END, "Error: Both programs must be provided.")
+                return
+
+            try:
+                # Check equivalence
+                result = verifier.check_equivalence(code1, code2)
+
+                # Parse and process both programs for SSA and SMT output
+                parser = Parser()
+                ast1 = parser.parse_program(code1)
+                ast2 = parser.parse_program(code2)
+
+                unroller = LoopUnroller(parser)
+                unroller.set_unroll_depth(unroll_depth)
+                unrolled_ast1 = unroller.unroll_program(ast1)
+                unrolled_ast2 = unroller.unroll_program(ast2)
+
+                converter = SSAConverter()
+                ssa_program1 = converter.convert_program(unrolled_ast1)
+                ssa_program2 = converter.convert_program(unrolled_ast2)
+
+                # Capture SSA output
+                ssa_output = []
+                def capture_ssa(*args):
+                    ssa_output.append(" ".join(map(str, args)) + "\n")
+                original_print = print
+                globals()['print'] = capture_ssa
+                pretty_print_ssa(ssa_program1)
+                ssa_output.append("\nProgram 2 SSA:\n")
+                pretty_print_ssa(ssa_program2)
+                globals()['print'] = original_print
+                ssa_text = "".join(ssa_output)
+
+                # Generate SMT for both programs
+                smt_output = f"Program 1 SMT:\n{generate_smt_lib(ssa_program1)}\n\nProgram 2 SMT:\n{generate_smt_lib(ssa_program2)}"
+
+                # Display outputs
+                self.ssa_panel.insert(tk.END, f"SSA Forms:\n{ssa_text}")
+                self.smt_panel.insert(tk.END, smt_output)
+
+                # Display equivalence result
+                if result['equivalent']:
+                    self.results_panel.insert(tk.END, "✓ Programs are semantically equivalent")
+                else:
+                    self.results_panel.insert(tk.END, "✗ Programs are NOT equivalent\nCounterexample:\n")
+                    for var, value in result.get('counterexample', {}).items():
+                        self.results_panel.insert(tk.END, f"  {var} = {value}\n")
+
+                # Draw CFG for the first program
+                self.draw_cfg(converter.cfg, ssa_program1)
+
+            except Exception as e:
+                self.results_panel.insert(tk.END, f"Error during equivalence check: {str(e)}")
+
+    def draw_cfg(self, cfg, ssa_program):
+        dot = Digraph(format='png')
+        # Add nodes for each block
+        for block in ssa_program:
+            label = block['label']
+            statements = "\n".join([self.pretty_stmt_str(stmt) for stmt in block['statements']])
+            dot.node(label, f"{label}\n{statements}", shape="box")
+
+        # Add edges from the CFG
+        for src, dests in cfg.items():
+            for dest in dests:
+                dot.edge(src, dest)
+
+        # Render the graph
+        try:
+            dot.render('cfg', cleanup=True)
+            if os.path.exists("cfg.png"):
+                cfg_img = Image.open("cfg.png")
+                # Scale to 80% of original size for readability
+                new_width = int(cfg_img.width * 0.8)
+                new_height = int(cfg_img.height * 0.8)
+                cfg_img = cfg_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                self.cfg_photo = ImageTk.PhotoImage(cfg_img)
+                self.cfg_image_label.configure(image=self.cfg_photo)
+                self.cfg_image_label.image = self.cfg_photo  # Prevent garbage collection
+        except Exception as e:
+            self.results_panel.insert(tk.END, f"Error rendering CFG: {str(e)}")
+
+    def pretty_stmt_str(self, stmt):
+        if stmt['type'] == 'ssa_assign':
+            return f"{stmt['var']} := {self.pretty_expr_str(stmt['expr'])}"
+        elif stmt['type'] == 'ssa_if':
+            return f"if {self.pretty_expr_str(stmt['condition'])}"
+        elif stmt['type'] == 'ssa_condition':
+            return f"if {self.pretty_expr_str(stmt['condition'])}"
+        elif stmt['type'] == 'ssa_jump':
+            return f"goto {stmt['target']}"
+        elif stmt['type'] == 'ssa_assert':
+            return f"assert {self.pretty_expr_str(stmt['condition'])}"
+        elif stmt['type'] == 'phi':
+            sources = ", ".join([f"{k}:{v}" for k, v in stmt['sources'].items()])
+            return f"{stmt['var']} := φ({sources})"
+        return stmt['type']
+
+    def pretty_expr_str(self, expr):
+        if expr['type'] == 'number':
+            return str(expr['value'])
+        elif expr['type'] == 'variable':
+            return expr['name']
+        elif expr['type'] == 'binary':
+            return f"({self.pretty_expr_str(expr['left'])} {expr['op']} {self.pretty_expr_str(expr['right'])})"
+        elif expr['type'] == 'array_access':
+            return f"{expr['array']}[{self.pretty_expr_str(expr['index'])}]"
+        return expr['type']
+
+    def clear_all(self):
+        self.verification_input.delete("1.0", tk.END)
+        self.equiv_input1.delete("1.0", tk.END)
+        self.equiv_input2.delete("1.0", tk.END)
+        self.ssa_panel.delete("1.0", tk.END)
+        self.smt_panel.delete("1.0", tk.END)
+        self.results_panel.delete("1.0", tk.END)
+        self.cfg_image_label.configure(image='')
+
+if __name__ == "__main__":
+    window = tk.Tk()
+    app = FormalVerificationGUI(window)
+    window.mainloop()
