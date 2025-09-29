@@ -1,1 +1,1 @@
-![project frontend](project1.png)
+![project frontend](project1.jpg)
